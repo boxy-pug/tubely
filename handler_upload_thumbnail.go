@@ -1,10 +1,14 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
@@ -43,10 +47,36 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 	}
 	defer file.Close()
 
-	imgData, err := io.ReadAll(file)
+	/*
+		imgData, err := io.ReadAll(file)
+		if err != nil {
+			respondWithError(w, http.StatusInternalServerError, "unable to read img data", err)
+			return
+		}
+	*/
+
+	fileExtension, err := determineFileExtension(header.Header.Get("Content-Type"))
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "unable to read img data", err)
+		respondWithError(w, http.StatusInternalServerError, "could not determine file ext", err)
 		return
+	}
+
+	thumbnailName, err := createRandomFileName()
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "could not create thumbnail filename", err)
+	}
+
+	thumbnailFilePath := filepath.Join(cfg.assetsRoot, fmt.Sprintf("%s.%s", thumbnailName, fileExtension))
+
+	outFile, err := os.Create(thumbnailFilePath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "could not create file", err)
+		return
+	}
+	defer outFile.Close()
+
+	if _, err := io.Copy(outFile, file); err != nil {
+		respondWithError(w, http.StatusInternalServerError, "could not copy file", err)
 	}
 
 	vidMetaData, err := cfg.db.GetVideo(videoID)
@@ -59,16 +89,27 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 		respondWithError(w, http.StatusUnauthorized, "wrong user", err)
 	}
 
-	tn := thumbnail{
-		data:      imgData,
-		mediaType: header.Header.Get("Content-Type"),
-	}
+	thumbnailUrl := fmt.Sprintf("http://localhost:%s/assets/%s.%s", cfg.port, thumbnailName, fileExtension)
 
-	videoThumbnails[videoID] = tn
-
-	thumbnailUrl := fmt.Sprintf("http://localhost:%s/api/thumbnails/%v", cfg.port, videoID)
-	log.Printf(thumbnailUrl)
 	vidMetaData.ThumbnailURL = &thumbnailUrl
+
+	/*
+		tn := thumbnail{
+			data:      imgData,
+			mediaType: header.Header.Get("Content-Type"),
+		}
+	*/
+	// videoThumbnails[videoID] = tn
+
+	// data := []byte(imgData)
+
+	//fmt.Sprintf("/assets/%v.%v", videoID, fileExtension)
+
+	// strData := base64.StdEncoding.EncodeToString(data)
+	// thumbnailUrl := fmt.Sprintf("data:image/png;base64,%v", strData)
+
+	// log.Printf(thumbnailFilePath)
+	// vidMetaData.ThumbnailURL = &thumbnailFilePath
 
 	err = cfg.db.UpdateVideo(vidMetaData)
 	if err != nil {
@@ -77,4 +118,23 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 	}
 
 	respondWithJSON(w, http.StatusOK, vidMetaData)
+}
+
+func determineFileExtension(mediaType string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(mediaType)) {
+	case "image/png":
+		return "png", nil
+	case "image/jpg", "image/jpeg":
+		return "jpg", nil
+	case "video/mp4":
+		return "mp4", nil
+	}
+	return "", fmt.Errorf("error determining file ext")
+}
+
+func createRandomFileName() (string, error) {
+	key := make([]byte, 32)
+	rand.Read(key)
+	newName := base64.RawURLEncoding.EncodeToString(key)
+	return newName, nil
 }
