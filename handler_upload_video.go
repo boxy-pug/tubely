@@ -1,19 +1,31 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
 )
+
+type Stream struct {
+	Width  int `json:"width"`
+	Height int `json:"height"`
+}
+
+type FFProbeOutput struct {
+	Streams []Stream `json:"streams"`
+}
 
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
 	// set upload limit of 1 gb
@@ -43,17 +55,20 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusInternalServerError, "error fetching video metadata", err)
 		return
 	}
+
 	// if user is not video owner, unauthorize
 	if userID != vidMetaData.UserID {
 		respondWithError(w, http.StatusUnauthorized, "user is not video owner", err)
 		return
 	}
+
 	// Parse the uploaded video file from the form data
 	err = r.ParseMultipartForm(10 << 20)
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "invalid form data", err)
 		return
 	}
+
 	// get file in memory
 	file, header, err := r.FormFile("video")
 	if err != nil {
@@ -61,12 +76,14 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	defer file.Close()
+
 	// validate file type
 	contentType := header.Header.Get("Content-Type")
 	mediatype, _, err := mime.ParseMediaType(contentType)
 	if err != nil || mediatype != "video/mp4" {
 		respondWithError(w, http.StatusBadRequest, "invalidfile format", err)
 	}
+
 	// Create temporary file
 	tempFile, err := os.CreateTemp("", "tubely-upload-*.mp4")
 	if err != nil {
@@ -88,19 +105,40 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	processedFilePath, err := processVideoForFastStart(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "failed to process video for fast start", err)
+		return
+	}
+	defer os.Remove(processedFilePath)
+
+	// get aspect ratio
+	aspectRatio, err := getVideoAspectRatio(processedFilePath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "failed to get video aspect ratio", err)
+		return
+	}
+
 	// Generate random key
 	keyBytes := make([]byte, 16)
 	if _, err := rand.Read(keyBytes); err != nil {
 		respondWithError(w, http.StatusInternalServerError, "failed to generate storage key", err)
 		return
 	}
-	key := hex.EncodeToString(keyBytes) + ".mp4"
+	key := fmt.Sprintf("%s/%s.mp4", aspectRatio, hex.EncodeToString(keyBytes))
+
+	processedFile, err := os.Open(processedFilePath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "failed to open processed file", err)
+		return
+	}
+	defer processedFile.Close()
 
 	// Upload to S3
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
 		Key:         &key,
-		Body:        tempFile,
+		Body:        processedFile,
 		ContentType: &contentType,
 	})
 	if err != nil {
@@ -129,4 +167,55 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		Message: "Video uploaded successfully",
 	})
 
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	// Run ffprobe command
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to run ffprobe: %w", err)
+	}
+
+	// Parse JSON output
+	var ffprobeOutput FFProbeOutput
+	if err := json.Unmarshal(out.Bytes(), &ffprobeOutput); err != nil {
+		return "", fmt.Errorf("failed to parse ffprobe output: %w", err)
+	}
+
+	if len(ffprobeOutput.Streams) == 0 {
+		return "", fmt.Errorf("no streams found in video")
+	}
+
+	// Get width and height
+	width := ffprobeOutput.Streams[0].Width
+	height := ffprobeOutput.Streams[0].Height
+
+	// Determine aspect ratio
+	ratio := float64(width) / float64(height)
+	if ratio > 1.7 && ratio < 1.8 {
+		// 16:9
+		return "landscape", nil
+	} else if ratio > 0.55 && ratio < 0.57 {
+		// 9:16
+		return "portrait", nil
+	} else {
+		return "other", nil
+	}
+}
+
+func processVideoForFastStart(filePath string) (string, error) {
+	outputFilePath := filePath + ".processing"
+
+	// Prepare the ffmpeg command
+	cmd := exec.Command("ffmpeg", "-i", filePath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", outputFilePath)
+
+	// Run the command
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to process video for fast start: %w", err)
+	}
+
+	return outputFilePath, nil
 }
